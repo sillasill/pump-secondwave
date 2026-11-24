@@ -13,7 +13,7 @@
 // over 6 hours of block time, it opens tiny 0.02 SOL probe round trips on liquid coins.
 // Pure function of the batches: no clock, no randomness, no I/O.
 
-import type { Batch, BotState, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
+import type { Batch, BotState, Mark, OrderInput, Pubkey } from './vendor/makefun-bot.ts';
 
 export interface Params {
   /** Slots after create during which the early high / post-high low are tracked. */
@@ -96,6 +96,10 @@ export const DEFAULT_PARAMS: Params = {
 const LAMPORTS = 1e9;
 const CURVE_FEE = 0.0125;
 
+/** Shared empty lookups, so a batch with no marks and no pending orders allocates nothing. */
+const EMPTY_MARKS: ReadonlyMap<Pubkey, Mark> = new Map();
+const EMPTY_MINTS: ReadonlySet<Pubkey> = new Set();
+
 interface Tick {
   slot: number;
   price: number;
@@ -109,6 +113,15 @@ interface Coin {
   ticks: Tick[];
   entries: number;
   lastExit: number;
+  /**
+   * Monotonic deques over the ticks inside the track window, built on first use
+   * and fed by each tick as it arrives: the high deque keeps decreasing prices
+   * (front is the early high), the low deque keeps increasing prices (front is
+   * the post-high low). Fronts older than the prune cut drop off at query time.
+   * Null until the coin is first evaluated for entry.
+   */
+  hiDq: { slot: number; price: number }[] | null;
+  loDq: { slot: number; price: number }[] | null;
 }
 
 interface Held {
@@ -138,7 +151,7 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
   const coinOf = (mint: Pubkey): Coin => {
     let c = coins.get(mint);
     if (c === undefined) {
-      c = { created: null, ticks: [], entries: 0, lastExit: -1e12 };
+      c = { created: null, ticks: [], entries: 0, lastExit: -1e12, hiDq: null, loDq: null };
       coins.set(mint, c);
     }
     return c;
@@ -171,6 +184,18 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
           const c = coinOf(e.mint);
           const price = Number(e.virtual_quote_reserves) / Number(e.virtual_token_reserves);
           c.ticks.push({ slot: e.slot, price, buy: e.is_buy, sol: Number(e.sol_amount) / LAMPORTS, user: e.user });
+          // Keep the entry deques current when they exist: a tick inside the track
+          // window joins both, the high deque shedding anything it beats, the low
+          // deque shedding anything it undercuts. A coin whose deques are not built
+          // yet picks its ticks up from the array when first evaluated.
+          if (c.hiDq !== null && c.created !== null && e.slot <= c.created + p.trackWindow) {
+            const hd = c.hiDq;
+            while (hd.length > 0 && hd[hd.length - 1]!.price < price) hd.pop();
+            hd.push({ slot: e.slot, price });
+            const ld = c.loDq!;
+            while (ld.length > 0 && ld[ld.length - 1]!.price >= price) ld.pop();
+            ld.push({ slot: e.slot, price });
+          }
           traded.add(e.mint);
         }
       }
@@ -185,9 +210,13 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
 
       const orders: OrderInput[] = [];
       const cap = state.hello.caps.max_orders_per_batch;
-      const marks = new Map(batch.marks.map((m) => [m.mint, m] as const));
-      const pendingMints = new Set<Pubkey>();
-      for (const po of state.pending.values()) pendingMints.add(po.order.mint);
+      const marks = batch.marks.length === 0 ? EMPTY_MARKS : new Map(batch.marks.map((m) => [m.mint, m] as const));
+      let pendingMints: ReadonlySet<Pubkey> = EMPTY_MINTS;
+      if (state.pending.size > 0) {
+        const pm = new Set<Pubkey>();
+        for (const po of state.pending.values()) pm.add(po.order.mint);
+        pendingMints = pm;
+      }
 
       // Exits first.
       for (const [mint, h] of held) {
@@ -273,24 +302,37 @@ export function createStrategy(p: Params = DEFAULT_PARAMS) {
         const rqSol = Number(curve.real_quote_reserves) / LAMPORTS;
         if (rqSol < p.minRqSol || rqSol > p.maxRqSol) continue;
         // Early high and post-high low inside the track window after create.
+        // Both come from the coin's monotonic deques now: the high deque's front
+        // is the early high, the low deque's front (past the high's slot) is the
+        // post-high low. Building the deques is one pass over the coin's kept
+        // ticks the first time it is evaluated; after that each new tick feeds
+        // them as it arrives, so no batch ever rescans the tick history.
         const t0 = c.created;
         const t1 = t0 + p.trackWindow;
-        let high = 0;
-        let highSlot = -1;
-        for (const t of c.ticks) {
-          if (t.slot > t1) break;
-          if (t.price > high) {
-            high = t.price;
-            highSlot = t.slot;
+        const cut = now - p.trackWindow - 400;
+        if (c.hiDq === null) {
+          const hd: { slot: number; price: number }[] = [];
+          const ld: { slot: number; price: number }[] = [];
+          for (const t of c.ticks) {
+            if (t.slot > t1) break;
+            while (hd.length > 0 && hd[hd.length - 1]!.price < t.price) hd.pop();
+            hd.push({ slot: t.slot, price: t.price });
+            while (ld.length > 0 && ld[ld.length - 1]!.price >= t.price) ld.pop();
+            ld.push({ slot: t.slot, price: t.price });
           }
+          c.hiDq = hd;
+          c.loDq = ld;
         }
+        const hd = c.hiDq;
+        while (hd.length > 0 && hd[0]!.slot < cut) hd.shift();
+        if (hd.length === 0) continue;
+        const high = hd[0]!.price;
+        const highSlot = hd[0]!.slot;
         if (high <= 0 || highSlot < 0) continue;
-        let low = Infinity;
-        for (const t of c.ticks) {
-          if (t.slot <= highSlot) continue;
-          if (t.slot > t1) break;
-          if (t.price < low) low = t.price;
-        }
+        const ld = c.loDq!;
+        while (ld.length > 0 && (ld[0]!.slot < cut || ld[0]!.slot <= highSlot)) ld.shift();
+        if (ld.length === 0) continue;
+        const low = ld[0]!.price;
         if (!Number.isFinite(low) || low > high * p.dipMax) continue;
         if (!(price >= low * p.recoverMult)) continue;
         // Recent flow: net buys and distinct buyers over the flow window.
